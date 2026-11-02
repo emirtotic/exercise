@@ -129,3 +129,49 @@ fn inc_3_does_not_return_busy_while_capacity_is_free() {
         );
     }
 }
+
+#[test]
+fn inc_4_dropped_permit_releases_slot() {
+    let pool =
+        ClusterPool::new(PoolConfig::default().group("g", vec![ClusterConfig::new("trino-1", 1)]));
+
+    let permit = pool.try_acquire("g").unwrap();
+
+    assert_eq!(pool.running("g", "trino-1"), Some(1));
+
+    // Simulate a query ending without explicit release.
+    drop(permit);
+
+    // check if the slot is released
+    assert_eq!(
+        pool.running("g", "trino-1"),
+        Some(0),
+        "Dropping a Permit must release its slot"
+    );
+
+    // The freed slot must be reusable.
+    let next = pool.try_acquire("g").expect("Slot must be reusable");
+
+    next.release();
+
+    assert_eq!(pool.running("g", "trino-1"), Some(0));
+}
+
+#[test]
+fn inc_4_explicit_release_does_not_double_decrement() {
+    let pool =
+        ClusterPool::new(PoolConfig::default().group("g", vec![ClusterConfig::new("trino-1", 1)]));
+
+    let permit = pool.try_acquire("g").unwrap();
+    permit.release();
+
+    assert_eq!(pool.running("g", "trino-1"), Some(0));
+
+    let next = pool.try_acquire("g").unwrap();
+
+    assert_eq!(pool.running("g", "trino-1"), Some(1));
+
+    drop(next);
+
+    assert_eq!(pool.running("g", "trino-1"), Some(0));
+}

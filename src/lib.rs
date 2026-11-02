@@ -182,6 +182,7 @@ impl ClusterPool {
                 pool: Arc::clone(self),
                 group: group.to_string(),
                 cluster: name,
+                state: Arc::clone(state),
             });
         }
 
@@ -198,10 +199,8 @@ impl ClusterPool {
         todo!("Part 3")
     }
 
-    fn release(&self, group: &str, cluster: &str) {
-        if let Some(state) = self.find(group, cluster) {
-            state.decrement();
-        }
+    fn release(&self, _group: &str, state: &ClusterState) {
+        state.decrement();
     }
 
     /// Current running count for a cluster, or `None` if it is not in the current config.
@@ -273,6 +272,7 @@ pub struct Permit {
     pool: Arc<ClusterPool>,
     group: String,
     cluster: String,
+    state: Arc<ClusterState>,
 }
 
 impl Permit {
@@ -282,6 +282,13 @@ impl Permit {
 
     /// Give the slot back once the query has finished.
     pub fn release(self) {
-        self.pool.release(&self.group, &self.cluster);
+        //self.pool.release(&self.group, &self.cluster);  I will move this
+        drop(self);
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.pool.release(&self.group, &self.state);
     }
 }
