@@ -148,7 +148,7 @@ impl ClusterPool {
     pub fn try_acquire(self: &Arc<Self>, group: &str) -> Result<Permit, AcquireError> {
         let clusters = self.clusters(group).ok_or(AcquireError::UnknownGroup)?;
 
-        let candidates: Vec<Candidate> = clusters
+        let mut candidates: Vec<Candidate> = clusters // list must be mutabile cuz it can be changed
             .iter()
             .map(|c| Candidate {
                 name: c.name.clone(),
@@ -157,29 +157,35 @@ impl ClusterPool {
             .filter(|c| c.available > 0)
             .collect();
 
-        let chosen = pick(&candidates).ok_or(AcquireError::Busy)?;
-        let name = candidates[chosen].name.clone();
-        let state = clusters
-            .iter()
-            .find(|c| c.name == name)
-            .ok_or(AcquireError::Busy)?;
+        while let Some(chosen) = pick(&candidates) {
+            // swap_remove removes the candidate from the list. Pick method will always find candidate with max number of free slots
+            let name = candidates.swap_remove(chosen).name;
 
-        if !state.try_increment() {
-            return Err(AcquireError::Busy);
+            let state = clusters
+                .iter()
+                .find(|c| c.name == name)
+                .ok_or(AcquireError::Busy)?;
+
+            // If another thread locks the slot, do not return busy. Try another candidate instead
+            if !state.try_increment() {
+                continue;
+            }
+
+            *self
+                .admissions
+                .lock()
+                .unwrap()
+                .entry(format!("{group}/{name}"))
+                .or_insert(0) += 1;
+
+            return Ok(Permit {
+                pool: Arc::clone(self),
+                group: group.to_string(),
+                cluster: name,
+            });
         }
 
-        *self
-            .admissions
-            .lock()
-            .unwrap()
-            .entry(format!("{group}/{name}"))
-            .or_insert(0) += 1;
-
-        Ok(Permit {
-            pool: Arc::clone(self),
-            group: group.to_string(),
-            cluster: name,
-        })
+        Err(AcquireError::Busy)
     }
 
     /// Part 3: like `try_acquire`, but wait up to `wait` for a slot to free up.

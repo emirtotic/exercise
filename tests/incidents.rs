@@ -76,3 +76,56 @@ fn inc_2_capacity_cut_does_not_block_other_clusters() {
         permit.release();
     }
 }
+
+#[test]
+fn inc_3_does_not_return_busy_while_capacity_is_free() {
+    const THREADS: usize = 32;
+
+    for round in 0..100 {
+        let clusters: Vec<_> = (0..THREADS)
+            .map(|i| ClusterConfig::new(format!("trino-{i}"), 1))
+            .collect();
+
+        let pool = ClusterPool::new(PoolConfig::default().group("g", clusters));
+
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        let mut handles = Vec::new();
+
+        for _ in 0..THREADS {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                pool.try_acquire("g")
+            }));
+        }
+
+        barrier.wait();
+
+        let mut permits = Vec::new();
+        let mut busy_count = 0;
+
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(permit) => permits.push(permit),
+                Err(admission::AcquireError::Busy) => {
+                    busy_count += 1;
+                }
+                Err(error) => panic!("Unexpected error: {error:?}"),
+            }
+        }
+
+        let admitted = permits.len();
+
+        for permit in permits {
+            permit.release();
+        }
+
+        assert_eq!(
+            busy_count, 0,
+            "Round {round}: {busy_count} Busy errors, \
+             only {admitted}/{THREADS} admitted"
+        );
+    }
+}
