@@ -80,12 +80,23 @@ impl ClusterState {
     }
 
     fn try_increment(&self) -> bool {
-        let current = self.running.load(Ordering::Relaxed);
-        if current >= self.max_running() {
-            return false;
+        let mut current = self.running.load(Ordering::Relaxed);
+
+        loop {
+            if current >= self.max_running() {
+                return false;
+            }
+
+            match self.running.compare_exchange(
+                current,
+                current + 1, // Change running from current to current + 1 if the current value is still equal to current
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
         }
-        self.running.store(current + 1, Ordering::Relaxed);
-        true
     }
 
     fn decrement(&self) {
@@ -240,7 +251,10 @@ fn build_groups(config: &PoolConfig) -> HashMap<String, Vec<Arc<ClusterState>>> 
         .groups
         .iter()
         .map(|(group, clusters)| {
-            let states = clusters.iter().map(|c| Arc::new(ClusterState::new(c))).collect();
+            let states = clusters
+                .iter()
+                .map(|c| Arc::new(ClusterState::new(c)))
+                .collect();
             (group.clone(), states)
         })
         .collect()
