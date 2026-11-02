@@ -76,7 +76,9 @@ impl ClusterState {
     }
 
     fn available(&self) -> u64 {
-        self.max_running() - self.running()
+        //self.max_running() - self.running() ---> unsigned integer cant see the negatives: 10 - 30 = ?
+
+        self.max_running().saturating_sub(self.running())
     }
 
     fn try_increment(&self) -> bool {
