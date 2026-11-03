@@ -10,8 +10,9 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,14 +57,16 @@ struct ClusterState {
     name: String,
     max_running: AtomicU64,
     running: AtomicU64,
+    admissions: Arc<AtomicU64>,
 }
 
 impl ClusterState {
-    fn new(config: &ClusterConfig) -> Self {
+    fn new(config: &ClusterConfig, admissions: Arc<AtomicU64>) -> Self {
         Self {
             name: config.name.clone(),
             max_running: AtomicU64::new(config.max_running),
             running: AtomicU64::new(0),
+            admissions,
         }
     }
 
@@ -106,36 +109,26 @@ impl ClusterState {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Candidate {
-    name: String,
-    available: u64,
-}
-
-/// Least-loaded selection: the candidate with the most free slots wins.
-fn pick(candidates: &[Candidate]) -> Option<usize> {
-    candidates
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, c)| c.available)
-        .map(|(i, _)| i)
-}
-
 pub struct ClusterPool {
     groups: RwLock<HashMap<String, Vec<Arc<ClusterState>>>>,
-    admissions: Mutex<HashMap<String, u64>>,
+    admissions: Mutex<HashMap<(String, String), Arc<AtomicU64>>>,
+    next_start: AtomicUsize,
 }
 
 impl ClusterPool {
     pub fn new(config: PoolConfig) -> Arc<Self> {
+        let mut admissions = HashMap::new();
+        let groups = build_groups(&config, &mut admissions);
+
         Arc::new(Self {
-            groups: RwLock::new(build_groups(&config)),
-            admissions: Mutex::new(HashMap::new()),
+            groups: RwLock::new(groups),
+            admissions: Mutex::new(admissions),
+            next_start: AtomicUsize::new(0),
         })
     }
 
     fn clusters(&self, group: &str) -> Option<Vec<Arc<ClusterState>>> {
-        self.groups.read().unwrap().get(&group.to_string()).cloned()
+        self.groups.read().get(&group.to_string()).cloned()
     }
 
     fn find(&self, group: &str, cluster: &str) -> Option<Arc<ClusterState>> {
@@ -145,48 +138,43 @@ impl ClusterPool {
     }
 
     /// Admit one query to the least-loaded cluster of `group`, or fail fast with `Busy`.
+
     pub fn try_acquire(self: &Arc<Self>, group: &str) -> Result<Permit, AcquireError> {
-        let clusters = self.clusters(group).ok_or(AcquireError::UnknownGroup)?;
+        let state = {
+            let groups = self.groups.read();
+            let clusters = groups.get(group).ok_or(AcquireError::UnknownGroup)?;
 
-        let mut candidates: Vec<Candidate> = clusters // list must be mutabile cuz it can be changed
-            .iter()
-            .map(|c| Candidate {
-                name: c.name.clone(),
-                available: c.available(),
-            })
-            .filter(|c| c.available > 0)
-            .collect();
-
-        while let Some(chosen) = pick(&candidates) {
-            // swap_remove removes the candidate from the list. Pick method will always find candidate with max number of free slots
-            let name = candidates.swap_remove(chosen).name;
-
-            let state = clusters
-                .iter()
-                .find(|c| c.name == name)
-                .ok_or(AcquireError::Busy)?;
-
-            // If another thread locks the slot, do not return busy. Try another candidate instead
-            if !state.try_increment() {
-                continue;
+            if clusters.is_empty() {
+                return Err(AcquireError::Busy);
             }
 
-            *self
-                .admissions
-                .lock()
-                .unwrap()
-                .entry(format!("{group}/{name}"))
-                .or_insert(0) += 1;
+            let start = self.next_start.fetch_add(1, Ordering::Relaxed) % clusters.len();
 
-            return Ok(Permit {
-                pool: Arc::clone(self),
-                group: group.to_string(),
-                cluster: name,
-                state: Arc::clone(state),
-            });
-        }
+            let best = (0..clusters.len())
+                .map(|offset| &clusters[(start + offset) % clusters.len()])
+                .max_by_key(|state| state.available())
+                .ok_or(AcquireError::Busy)?;
 
-        Err(AcquireError::Busy)
+            let selected = if best.try_increment() {
+                Some(best)
+            } else {
+                clusters
+                    .iter()
+                    .filter(|candidate| !Arc::ptr_eq(candidate, best))
+                    .find(|candidate| candidate.try_increment())
+            };
+
+            Arc::clone(selected.ok_or(AcquireError::Busy)?)
+        };
+
+        state.admissions.fetch_add(1, Ordering::Relaxed);
+
+        Ok(Permit {
+            pool: Arc::clone(self),
+            group: group.to_string(),
+            cluster: state.name.clone(),
+            state,
+        })
     }
 
     /// Part 3: like `try_acquire`, but wait up to `wait` for a slot to free up.
@@ -219,8 +207,8 @@ impl ClusterPool {
         self.admissions
             .lock()
             .unwrap()
-            .get(&format!("{group}/{cluster}"))
-            .copied()
+            .get(&(group.to_owned(), cluster.to_owned()))
+            .map(|counter| counter.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 
@@ -236,7 +224,10 @@ impl ClusterPool {
     /// A cluster keeps its identity across reloads by (group, name). Clusters removed
     /// from the config take no new queries; clusters added to it take traffic at once.
     pub fn reload(&self, config: PoolConfig) {
-        *self.groups.write().unwrap() = build_groups(&config);
+        let mut admissions = self.admissions.lock().unwrap();
+        let groups = build_groups(&config, &mut admissions);
+
+        *self.groups.write() = groups;
     }
 
     /// Bonus: correct a cluster's running counter against the engine's own count.
@@ -253,15 +244,29 @@ impl ClusterPool {
     }
 }
 
-fn build_groups(config: &PoolConfig) -> HashMap<String, Vec<Arc<ClusterState>>> {
+fn build_groups(
+    config: &PoolConfig,
+    admissions: &mut HashMap<(String, String), Arc<AtomicU64>>,
+) -> HashMap<String, Vec<Arc<ClusterState>>> {
     config
         .groups
         .iter()
         .map(|(group, clusters)| {
             let states = clusters
                 .iter()
-                .map(|c| Arc::new(ClusterState::new(c)))
+                .map(|cluster| {
+                    let key = (group.clone(), cluster.name.clone());
+
+                    let counter = Arc::clone(
+                        admissions
+                            .entry(key)
+                            .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+                    );
+
+                    Arc::new(ClusterState::new(cluster, counter))
+                })
                 .collect();
+
             (group.clone(), states)
         })
         .collect()

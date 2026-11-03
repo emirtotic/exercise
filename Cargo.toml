@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+parking_lot = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
