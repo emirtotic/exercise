@@ -27,7 +27,6 @@ fn admissions_survive_release_and_reload() {
     assert_eq!(pool.admissions("g", "trino-1"), 4);
 }
 
-
 #[test]
 fn benchmark_workload_admits_every_request() {
     const THREADS: usize = 16;
@@ -37,9 +36,7 @@ fn benchmark_workload_admits_every_request() {
         .map(|i| ClusterConfig::new(format!("trino-{i}"), 1_000_000))
         .collect();
 
-    let pool = ClusterPool::new(
-        PoolConfig::default().group("analytics", clusters),
-    );
+    let pool = ClusterPool::new(PoolConfig::default().group("analytics", clusters));
 
     let mut handles = Vec::new();
 
@@ -62,11 +59,8 @@ fn benchmark_workload_admits_every_request() {
     }
 
     let total: u64 = (0..8)
-        .map(|i| {
-            pool.admissions("analytics", &format!("trino-{i}"))
-        })
+        .map(|i| pool.admissions("analytics", &format!("trino-{i}")))
         .sum();
 
     assert_eq!(total, (THREADS * REQUESTS) as u64);
 }
-

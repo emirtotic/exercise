@@ -115,3 +115,28 @@ async fn no_lost_wakeups_under_load() {
     assert_eq!(pool.running("g", "a"), Some(0));
     assert_eq!(pool.queued("g"), 0);
 }
+
+// Testing edge casew if timeout is 0 and the cluster is full
+
+#[tokio::test]
+async fn zero_timeout_does_not_leave_waiter() {
+    let pool = ClusterPool::new(
+        PoolConfig::default().group(
+            "g",
+            vec![ClusterConfig::new("trino-1", 1)],
+        ),
+    );
+
+    let permit = pool.try_acquire("g").unwrap();
+
+    let result = pool
+        .acquire_timeout("g", std::time::Duration::ZERO)
+        .await;
+
+    assert!(matches!(result, Err(AcquireError::Timeout)));
+    assert_eq!(pool.queued("g"), 0);
+
+    drop(permit);
+    assert_eq!(pool.running("g", "trino-1"), Some(0));
+}
+

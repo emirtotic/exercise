@@ -8,12 +8,13 @@
 //!
 //! See README.md for the tasks.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::future::Future;
-use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterConfig {
@@ -109,10 +110,27 @@ impl ClusterState {
     }
 }
 
+// Mechanism for waking up and num of waiting requests per group
+#[derive(Default)]
+struct GroupWaiters {
+    notify: Notify,
+    queued: AtomicU64,
+}
+
+// decrease the counter when async method is over
+struct QueueGuard(Arc<GroupWaiters>);
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct ClusterPool {
     groups: RwLock<HashMap<String, Vec<Arc<ClusterState>>>>,
     admissions: Mutex<HashMap<(String, String), Arc<AtomicU64>>>,
     next_start: AtomicUsize,
+    waiters: RwLock<HashMap<String, Arc<GroupWaiters>>>,
 }
 
 impl ClusterPool {
@@ -124,6 +142,7 @@ impl ClusterPool {
             groups: RwLock::new(groups),
             admissions: Mutex::new(admissions),
             next_start: AtomicUsize::new(0),
+            waiters: RwLock::new(HashMap::new()),
         })
     }
 
@@ -178,17 +197,62 @@ impl ClusterPool {
     }
 
     /// Part 3: like `try_acquire`, but wait up to `wait` for a slot to free up.
+
     pub async fn acquire_timeout(
         self: &Arc<Self>,
         group: &str,
         wait: Duration,
     ) -> Result<Permit, AcquireError> {
-        let _ = (group, wait);
-        todo!("Part 3")
+        // PART 3
+
+        match self.try_acquire(group) {
+            Ok(permit) => return Ok(permit),
+            Err(AcquireError::Busy) => {}
+            Err(error) => return Err(error),
+        }
+
+        let waiters = {
+            let mut groups = self.waiters.write();
+
+            Arc::clone(
+                groups
+                    .entry(group.to_string())
+                    .or_insert_with(|| Arc::new(GroupWaiters::default())),
+            )
+        };
+
+        waiters.queued.fetch_add(1, Ordering::Relaxed);
+        let _guard = QueueGuard(Arc::clone(&waiters));
+
+        let deadline = tokio::time::Instant::now() + wait;
+
+        loop {
+            let notified = waiters.notify.notified();
+            tokio::pin!(notified);
+
+            notified.as_mut().enable();
+
+            match self.try_acquire(group) {
+                Ok(permit) => return Ok(permit),
+                Err(AcquireError::Busy) => {}
+                Err(error) => return Err(error),
+            }
+
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(AcquireError::Timeout);
+                }
+            }
+        }
     }
 
-    fn release(&self, _group: &str, state: &ClusterState) {
+    fn release(&self, group: &str, state: &ClusterState) {
         state.decrement();
+
+        if let Some(waiters) = self.waiters.read().get(group) {
+            waiters.notify.notify_one();
+        }
     }
 
     /// Current running count for a cluster, or `None` if it is not in the current config.
@@ -198,8 +262,13 @@ impl ClusterPool {
 
     /// Number of callers currently waiting inside `acquire_timeout` for `group`.
     pub fn queued(&self, group: &str) -> u64 {
-        let _ = group;
-        todo!("Part 3")
+        // Part 3
+
+        self.waiters
+            .read()
+            .get(group)
+            .map(|state| state.queued.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Total queries ever admitted to a cluster (a metric scraped by Prometheus).
