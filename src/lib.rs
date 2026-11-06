@@ -356,7 +356,6 @@ impl Permit {
 
     /// Give the slot back once the query has finished.
     pub fn release(self) {
-        //self.pool.release(&self.group, &self.cluster);  I will move this
         drop(self);
     }
 }

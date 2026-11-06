@@ -120,18 +120,12 @@ async fn no_lost_wakeups_under_load() {
 
 #[tokio::test]
 async fn zero_timeout_does_not_leave_waiter() {
-    let pool = ClusterPool::new(
-        PoolConfig::default().group(
-            "g",
-            vec![ClusterConfig::new("trino-1", 1)],
-        ),
-    );
+    let pool =
+        ClusterPool::new(PoolConfig::default().group("g", vec![ClusterConfig::new("trino-1", 1)]));
 
     let permit = pool.try_acquire("g").unwrap();
 
-    let result = pool
-        .acquire_timeout("g", std::time::Duration::ZERO)
-        .await;
+    let result = pool.acquire_timeout("g", std::time::Duration::ZERO).await;
 
     assert!(matches!(result, Err(AcquireError::Timeout)));
     assert_eq!(pool.queued("g"), 0);
@@ -139,4 +133,3 @@ async fn zero_timeout_does_not_leave_waiter() {
     drop(permit);
     assert_eq!(pool.running("g", "trino-1"), Some(0));
 }
-
